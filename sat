@@ -1,0 +1,148 @@
+import os
+import json
+import hashlib
+import requests
+import pandas as pd
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+BASE_URL = "https://educationdata.urban.org/api/v1/"
+CACHE_DIR = "cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+YEARS = [2011,2013,2015,2017,2020]
+FIPS_LIST = [55, 27, 17, 18, 39, 19, 31, 8, 37, 26, 13, 41, 48]
+
+RACE_MAP = {
+    1: "White", 2: "Black", 3: "Hispanic", 4: "Asian",
+    5: "American Indian/Alaska Native", 6: "Native Hawaiian/Pacific Islander",
+    7: "Two or more races", 8: "Nonresident alien"
+}
+
+SEX_MAP = {
+    1: "Male",
+    2: "Female"
+}
+
+VALID_RACES = set(RACE_MAP.keys())
+VALID_SEXES = set(SEX_MAP.keys())
+
+city_state_to_county = {
+    ("madison", "WI"): "Dane County, WI",
+    ("st. paul", "MN"): "Ramsey County, MN",
+    ("springfield", "IL"): "Sangamon County, IL",
+    ("indianapolis", "IN"): "Marion County, IN",
+    ("columbus", "OH"): "Franklin County, OH",
+    ("des moines", "IA"): "Polk County, IA",
+    ("lincoln", "NE"): "Lancaster County, NE",
+    ("boulder", "CO"): "Boulder County, CO",
+    ("raleigh", "NC"): "Wake County, NC",
+    ("champaign", "IL"): "Champaign County, IL",
+    ("green bay", "WI"): "Brown County, WI",
+    ("milwaukee", "WI"): "Milwaukee County, WI",
+    ("ann arbor", "MI"): "Washtenaw County, MI",
+    ("athens", "GA"): "Clarke County, GA",
+    ("eugene", "OR"): "Lane County, OR",
+    ("rockwall", "TX"): "Rockwall County, TX"
+}
+
+target_counties = {
+    "Dane County, WI", "Ramsey County, MN", "Sangamon County, IL", "Marion County, IN",
+    "Franklin County, OH", "Polk County, IA", "Lancaster County, NE", "Boulder County, CO",
+    "Wake County, NC", "Champaign County, IL", "Brown County, WI", "Milwaukee County, WI",
+    "Washtenaw County, MI", "Clarke County, GA", "Lane County, OR", "Rockwall County, TX"
+}
+
+leaid_county_map = []
+
+for year in YEARS:
+    url = f"{BASE_URL}schools/ccd/directory/{year}/"
+    print(f"Fetching {year}...")
+
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        results = response.json().get("results", [])
+
+        for record in results:
+            leaid = record.get("leaid")
+            city = record.get("city_mailing", "").lower().strip()
+            state = record.get("state_mailing", "").strip()
+            county_full = city_state_to_county.get((city, state))
+
+            if county_full and leaid:
+                leaid_county_map.append({
+                    "leaid": leaid,
+                    "county_full": county_full,
+                    "year": year
+                })
+
+    except Exception as e:
+        print(f"Failed for {year}: {e}")
+
+# Build DataFrame from results
+df_mapping = pd.DataFrame(leaid_county_map)
+
+# Deduplicate on unitid (keep latest)
+df_mapping = df_mapping.sort_values("year").drop_duplicates(subset="leaid", keep="last")
+
+# # Load existing unitid → county_fips_str mapping
+leaid_map = df_mapping
+leaid_map = leaid_map[['leaid', 'county_full']]
+
+# # Valid categories
+VALID_RACES = set(range(1, 9))  # 1–9
+VALID_SEXES = {1, 2}            # Male, Female
+
+# # Setup
+years = [2011,2013,2015,2017,2020]
+fips = [55, 27, 17, 18, 39, 19, 31, 8, 37, 26, 13, 41, 48]
+records = []
+
+for year in years:
+     print(f"Fetching {year} for {fip}")
+     for fip in fips:
+         url = f"{BASE_URL}schools/crdc/sat-act-participation/{year}/race/sex?fips={fip}"
+        
+         try:
+             resp = requests.get(url)
+             resp.raise_for_status()
+             for row in resp.json().get("results", []):
+                 leaid = row.get("leaid")
+                 race = row.get("race")
+                 sex = row.get("sex")
+                 student_participation = row.get("students_SAT_ACT")
+                 fips_val = row.get("fips")
+
+
+                 if (
+                     leaid is not None and
+                     student_participation is not None and
+                     student_participation not in (-1, -2, -3) and
+                     race in VALID_RACES and
+                     sex in VALID_SEXES
+                 ):
+                     records.append({
+                         "leaid": leaid,
+                         "race": race,
+                         "sex": sex,
+                         "student_participation": student_participation,  
+                         "year": year,
+                         "fips": fips_val
+                     })
+         except Exception as e:
+             print(f"Error fetching {year}: {e}")
+
+# # Load into DataFrame
+df = pd.DataFrame(records)
+
+# # Join with county mapping
+df2 = df.merge(leaid_map, on="leaid", how="inner")
+
+# # Filter out rows without mapped counties
+# df = df[df['county_fips_str'].notna()]
+
+# # Aggregate by county × race × sex
+# agg_df = df2.groupby(['county_full', 'race', 'sex', 'year'])['graduation_rate'].mean().reset_index()
+# agg_df['race'] = agg_df['race'].map(RACE_MAP)
+# agg_df['sex'] = agg_df['sex'].map(SEX_MAP)
